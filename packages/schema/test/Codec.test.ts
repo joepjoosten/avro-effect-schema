@@ -15,7 +15,7 @@ class Post extends Schema.TaggedClass<Post>()("Post", {
   metadata: Schema.Record(Schema.String, Schema.String)
 }) {}
 
-describe("avro-effect-schema", () => {
+describe("@avro-effect/schema", () => {
   it.effect("round-trips Effect classes through Avro binary", () =>
     Effect.gen(function*() {
       const PostAvro = avro(Post)
@@ -35,7 +35,7 @@ describe("avro-effect-schema", () => {
       expect(decoded).toEqual(post)
     }))
 
-  it.effect("adapts avro-js wrapped unions to plain Effect values", () =>
+  it.effect("round-trips tagged unions through native Avro unions", () =>
     Effect.gen(function*() {
       class Deleted extends Schema.TaggedClass<Deleted>()("Deleted", {
         id: Long
@@ -116,4 +116,3 @@ describe("avro-effect-schema", () => {
       expect([...decode(encode(value)).data]).toEqual([1, 2, 3])
     }))
 })
-

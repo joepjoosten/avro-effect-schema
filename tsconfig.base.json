@@ -35,8 +35,10 @@
     "removeComments": false,
     "plugins": [{ "name": "@effect/language-service" }],
     "paths": {
-      "avro-effect-schema": ["./packages/avro-effect-schema/src/index.ts"],
-      "avro-effect-schema/*": ["./packages/avro-effect-schema/src/*.ts"]
+      "@avro-effect/core": ["./packages/core/src/index.ts"],
+      "@avro-effect/core/*": ["./packages/core/src/*.ts"],
+      "@avro-effect/schema": ["./packages/schema/src/index.ts"],
+      "@avro-effect/schema/*": ["./packages/schema/src/*.ts"]
     }
   }
 }

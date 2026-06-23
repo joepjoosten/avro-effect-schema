@@ -1,0 +1,731 @@
+import { Buffer } from "node:buffer"
+import { Effect } from "effect"
+
+export type AvroPrimitive =
+  | "null"
+  | "boolean"
+  | "int"
+  | "long"
+  | "float"
+  | "double"
+  | "bytes"
+  | "string"
+
+export interface AvroRecordField {
+  readonly name: string
+  readonly type: AvroSchema
+  readonly doc?: string
+  readonly default?: unknown
+  readonly order?: "ascending" | "descending" | "ignore"
+  readonly aliases?: ReadonlyArray<string>
+}
+
+export interface AvroRecordSchema {
+  readonly type: "record" | "error"
+  readonly name: string
+  readonly namespace?: string
+  readonly doc?: string
+  readonly aliases?: ReadonlyArray<string>
+  readonly fields: ReadonlyArray<AvroRecordField>
+  readonly [key: string]: unknown
+}
+
+export interface AvroEnumSchema {
+  readonly type: "enum"
+  readonly name: string
+  readonly namespace?: string
+  readonly doc?: string
+  readonly aliases?: ReadonlyArray<string>
+  readonly symbols: ReadonlyArray<string>
+  readonly default?: string
+}
+
+export interface AvroArraySchema {
+  readonly type: "array"
+  readonly items: AvroSchema
+}
+
+export interface AvroMapSchema {
+  readonly type: "map"
+  readonly values: AvroSchema
+}
+
+export interface AvroFixedSchema {
+  readonly type: "fixed"
+  readonly name: string
+  readonly namespace?: string
+  readonly aliases?: ReadonlyArray<string>
+  readonly size: number
+  readonly logicalType?: string
+}
+
+export interface AvroLogicalSchema {
+  readonly type: AvroSchema
+  readonly logicalType: string
+  readonly precision?: number
+  readonly scale?: number
+}
+
+export type AvroNamedSchema = AvroRecordSchema | AvroEnumSchema | AvroFixedSchema
+export type AvroUnionSchema = ReadonlyArray<AvroSchema>
+export type AvroSchema =
+  | AvroPrimitive
+  | string
+  | AvroRecordSchema
+  | AvroEnumSchema
+  | AvroArraySchema
+  | AvroMapSchema
+  | AvroFixedSchema
+  | AvroLogicalSchema
+  | AvroUnionSchema
+
+type AvroObjectSchema = Exclude<AvroSchema, string | AvroUnionSchema>
+
+export class AvroError extends Error {
+  readonly cause?: unknown
+
+  constructor(message: string, cause?: unknown) {
+    super(message)
+    this.name = "AvroError"
+    this.cause = cause
+  }
+}
+
+export interface Type<A = unknown> {
+  readonly schema: AvroSchema
+  readonly toBuffer: (value: A) => Buffer
+  readonly fromBuffer: (buffer: Buffer | Uint8Array) => A
+  readonly encode: (value: A) => Buffer
+  readonly decode: (buffer: Buffer | Uint8Array) => A
+  readonly isValid: (value: unknown) => value is A
+  readonly getSchema: () => string
+}
+
+export interface ParseOptions {
+  readonly namespace?: string
+}
+
+type Node =
+  | { readonly _tag: "null"; readonly schema: AvroSchema }
+  | { readonly _tag: "boolean"; readonly schema: AvroSchema }
+  | { readonly _tag: "int"; readonly schema: AvroSchema }
+  | { readonly _tag: "long"; readonly schema: AvroSchema }
+  | { readonly _tag: "float"; readonly schema: AvroSchema }
+  | { readonly _tag: "double"; readonly schema: AvroSchema }
+  | { readonly _tag: "bytes"; readonly schema: AvroSchema }
+  | { readonly _tag: "string"; readonly schema: AvroSchema }
+  | { readonly _tag: "array"; readonly schema: AvroArraySchema; readonly item: Node }
+  | { readonly _tag: "map"; readonly schema: AvroMapSchema; readonly value: Node }
+  | { readonly _tag: "enum"; readonly schema: AvroEnumSchema; readonly name: string; readonly symbols: ReadonlyArray<string> }
+  | { readonly _tag: "fixed"; readonly schema: AvroFixedSchema; readonly name: string; readonly size: number }
+  | { readonly _tag: "record"; readonly schema: AvroRecordSchema; readonly name: string; fields: ReadonlyArray<FieldNode> }
+  | { readonly _tag: "union"; readonly schema: AvroUnionSchema; readonly branches: ReadonlyArray<Node> }
+  | { readonly _tag: "ref"; readonly schema: string; readonly name: string; readonly registry: Registry }
+
+interface FieldNode {
+  readonly name: string
+  readonly node: Node
+  readonly defaultValue: unknown
+  readonly hasDefault: boolean
+}
+
+interface Registry {
+  readonly nodes: Map<string, Node>
+  readonly aliases: Map<string, string>
+}
+
+const primitiveNames = new Set<AvroPrimitive>([
+  "null",
+  "boolean",
+  "int",
+  "long",
+  "float",
+  "double",
+  "bytes",
+  "string"
+])
+
+export const parse = <A = unknown>(schema: AvroSchema, options: ParseOptions = {}): Type<A> => {
+  const registry: Registry = {
+    nodes: new Map(),
+    aliases: new Map()
+  }
+  const node = compile(schema, registry, options.namespace)
+
+  const api: Type<A> = {
+    schema,
+    toBuffer: (value) => {
+      const writer = new BinaryWriter()
+      writeNode(resolveNode(node), value, writer)
+      return writer.toBuffer()
+    },
+    fromBuffer: (input) => {
+      const reader = new BinaryReader(Buffer.from(input))
+      const value = readNode(resolveNode(node), reader) as A
+      if (!reader.done) {
+        throw new AvroError(`Trailing Avro data at offset ${reader.offset}`)
+      }
+      return value
+    },
+    encode(value) {
+      return api.toBuffer(value)
+    },
+    decode(buffer) {
+      return api.fromBuffer(buffer)
+    },
+    isValid: (value): value is A => matchesNode(resolveNode(node), value),
+    getSchema: () => JSON.stringify(schema)
+  }
+  return api
+}
+
+export const encode = <A>(schema: AvroSchema, value: A, options?: ParseOptions): Buffer =>
+  parse<A>(schema, options).toBuffer(value)
+
+export const decode = <A = unknown>(schema: AvroSchema, buffer: Buffer | Uint8Array, options?: ParseOptions): A =>
+  parse<A>(schema, options).fromBuffer(buffer)
+
+export const encodeEffect = <A>(schema: AvroSchema, value: A, options?: ParseOptions) =>
+  Effect.try({
+    try: () => encode(schema, value, options),
+    catch: (error) => new AvroError(`Unable to encode Avro value: ${message(error)}`, error)
+  })
+
+export const decodeEffect = <A = unknown>(schema: AvroSchema, buffer: Buffer | Uint8Array, options?: ParseOptions) =>
+  Effect.try({
+    try: () => decode<A>(schema, buffer, options),
+    catch: (error) => new AvroError(`Unable to decode Avro value: ${message(error)}`, error)
+  })
+
+const compile = (schema: AvroSchema, registry: Registry, namespace: string | undefined): Node => {
+  if (typeof schema === "string") {
+    if (primitiveNames.has(schema as AvroPrimitive)) {
+      return primitive(schema as AvroPrimitive, schema)
+    }
+    return { _tag: "ref", schema, name: qualify(schema, namespace), registry }
+  }
+  if (Array.isArray(schema)) {
+    return {
+      _tag: "union",
+      schema,
+      branches: schema.map((branch) => compile(branch, registry, namespace))
+    }
+  }
+
+  const objectSchema = schema as AvroObjectSchema
+  const type = objectSchema.type
+  if (typeof type !== "string") {
+    return compile(type, registry, namespace)
+  }
+  if (primitiveNames.has(type as AvroPrimitive)) {
+    return primitive(type as AvroPrimitive, objectSchema)
+  }
+
+  switch (type) {
+    case "record":
+    case "error": {
+      const recordSchema = objectSchema as AvroRecordSchema
+      const name = namedSchemaFullName(recordSchema.name, recordSchema.namespace ?? namespace)
+      const existing = registry.nodes.get(name)
+      if (existing !== undefined) {
+        return existing
+      }
+      const record: Extract<Node, { readonly _tag: "record" }> = {
+        _tag: "record",
+        schema: recordSchema,
+        name,
+        fields: []
+      }
+      registerNamed(recordSchema, name, record, registry)
+      record.fields = recordSchema.fields.map((field) => ({
+        name: field.name,
+        node: compile(field.type, registry, recordSchema.namespace ?? namespace),
+        defaultValue: field.default,
+        hasDefault: Object.hasOwn(field, "default")
+      }))
+      return record
+    }
+    case "enum": {
+      const enumSchema = objectSchema as AvroEnumSchema
+      const name = namedSchemaFullName(enumSchema.name, enumSchema.namespace ?? namespace)
+      const existing = registry.nodes.get(name)
+      if (existing !== undefined) {
+        return existing
+      }
+      const node: Node = { _tag: "enum", schema: enumSchema, name, symbols: enumSchema.symbols }
+      registerNamed(enumSchema, name, node, registry)
+      return node
+    }
+    case "array": {
+      const arraySchema = objectSchema as AvroArraySchema
+      return { _tag: "array", schema: arraySchema, item: compile(arraySchema.items, registry, namespace) }
+    }
+    case "map": {
+      const mapSchema = objectSchema as AvroMapSchema
+      return { _tag: "map", schema: mapSchema, value: compile(mapSchema.values, registry, namespace) }
+    }
+    case "fixed": {
+      const fixedSchema = objectSchema as AvroFixedSchema
+      const name = namedSchemaFullName(fixedSchema.name, fixedSchema.namespace ?? namespace)
+      const existing = registry.nodes.get(name)
+      if (existing !== undefined) {
+        return existing
+      }
+      const node: Node = { _tag: "fixed", schema: fixedSchema, name, size: fixedSchema.size }
+      registerNamed(fixedSchema, name, node, registry)
+      return node
+    }
+    default:
+      return { _tag: "ref", schema: type, name: qualify(type, namespace), registry }
+  }
+}
+
+const primitive = (type: AvroPrimitive, schema: AvroSchema): Node => {
+  switch (type) {
+    case "null":
+      return { _tag: "null", schema }
+    case "boolean":
+      return { _tag: "boolean", schema }
+    case "int":
+      return { _tag: "int", schema }
+    case "long":
+      return { _tag: "long", schema }
+    case "float":
+      return { _tag: "float", schema }
+    case "double":
+      return { _tag: "double", schema }
+    case "bytes":
+      return { _tag: "bytes", schema }
+    case "string":
+      return { _tag: "string", schema }
+  }
+}
+
+const registerNamed = (schema: AvroNamedSchema, name: string, node: Node, registry: Registry) => {
+  registry.nodes.set(name, node)
+  registry.nodes.set(unqualified(name), node)
+  for (const alias of schema.aliases ?? []) {
+    registry.aliases.set(alias, name)
+    registry.aliases.set(unqualified(alias), name)
+  }
+}
+
+const resolveNode = (node: Node): Node => {
+  if (node._tag !== "ref") {
+    return node
+  }
+  const alias = node.registry.aliases.get(node.name) ?? node.registry.aliases.get(unqualified(node.name))
+  const resolved = node.registry.nodes.get(node.name) ??
+    node.registry.nodes.get(unqualified(node.name)) ??
+    (alias === undefined ? undefined : node.registry.nodes.get(alias))
+  if (resolved === undefined) {
+    throw new AvroError(`Unknown Avro type reference ${node.name}`)
+  }
+  return resolved
+}
+
+const readNode = (node: Node, reader: BinaryReader): unknown => {
+  node = resolveNode(node)
+  switch (node._tag) {
+    case "null":
+      return null
+    case "boolean":
+      return reader.readByte() === 1
+    case "int":
+      return reader.readLong()
+    case "long":
+      return reader.readLong()
+    case "float":
+      return reader.readFloat()
+    case "double":
+      return reader.readDouble()
+    case "bytes":
+      return reader.readBytes()
+    case "string":
+      return reader.readString()
+    case "fixed":
+      return reader.readFixed(node.size)
+    case "enum": {
+      const index = reader.readLong()
+      const symbol = node.symbols[index]
+      if (symbol === undefined) {
+        throw new AvroError(`Invalid enum index ${index} for ${node.name}`)
+      }
+      return symbol
+    }
+    case "array": {
+      const out: Array<unknown> = []
+      readBlocks(reader, (count) => {
+        for (let index = 0; index < count; index++) {
+          out.push(readNode(node.item, reader))
+        }
+      })
+      return out
+    }
+    case "map": {
+      const out: Record<string, unknown> = {}
+      readBlocks(reader, (count) => {
+        for (let index = 0; index < count; index++) {
+          out[reader.readString()] = readNode(node.value, reader)
+        }
+      })
+      return out
+    }
+    case "record": {
+      const out: Record<string, unknown> = {}
+      for (const field of node.fields) {
+        out[field.name] = readNode(field.node, reader)
+      }
+      return out
+    }
+    case "union": {
+      const index = reader.readLong()
+      const branch = node.branches[index]
+      if (branch === undefined) {
+        throw new AvroError(`Invalid union branch index ${index}`)
+      }
+      return readNode(branch, reader)
+    }
+    case "ref":
+      return readNode(resolveNode(node), reader)
+  }
+}
+
+const writeNode = (node: Node, value: unknown, writer: BinaryWriter): void => {
+  node = resolveNode(node)
+  switch (node._tag) {
+    case "null":
+      if (value !== null) {
+        throw expected(node, value)
+      }
+      return
+    case "boolean":
+      if (typeof value !== "boolean") {
+        throw expected(node, value)
+      }
+      writer.writeByte(value ? 1 : 0)
+      return
+    case "int":
+      if (!Number.isInteger(value)) {
+        throw expected(node, value)
+      }
+      writer.writeLong(value as number)
+      return
+    case "long":
+      if (typeof value !== "number" || !Number.isFinite(value)) {
+        throw expected(node, value)
+      }
+      writer.writeLong(value)
+      return
+    case "float":
+      if (typeof value !== "number") {
+        throw expected(node, value)
+      }
+      writer.writeFloat(value)
+      return
+    case "double":
+      if (typeof value !== "number") {
+        throw expected(node, value)
+      }
+      writer.writeDouble(value)
+      return
+    case "bytes":
+      writer.writeBytes(toBuffer(value, "bytes"))
+      return
+    case "fixed":
+      writer.writeFixed(toBuffer(value, node.name), node.size)
+      return
+    case "string":
+      if (typeof value !== "string") {
+        throw expected(node, value)
+      }
+      writer.writeString(value)
+      return
+    case "enum": {
+      if (typeof value !== "string") {
+        throw expected(node, value)
+      }
+      const index = node.symbols.indexOf(value)
+      if (index === -1) {
+        throw expected(node, value)
+      }
+      writer.writeLong(index)
+      return
+    }
+    case "array":
+      if (!Array.isArray(value)) {
+        throw expected(node, value)
+      }
+      if (value.length > 0) {
+        writer.writeLong(value.length)
+        for (const item of value) {
+          writeNode(node.item, item, writer)
+        }
+      }
+      writer.writeLong(0)
+      return
+    case "map": {
+      if (!isRecordLike(value)) {
+        throw expected(node, value)
+      }
+      const entries = Object.entries(value)
+      if (entries.length > 0) {
+        writer.writeLong(entries.length)
+        for (const [key, item] of entries) {
+          writer.writeString(key)
+          writeNode(node.value, item, writer)
+        }
+      }
+      writer.writeLong(0)
+      return
+    }
+    case "record": {
+      if (!isRecordLike(value)) {
+        throw expected(node, value)
+      }
+      for (const field of node.fields) {
+        const fieldValue = Object.hasOwn(value, field.name)
+          ? value[field.name]
+          : field.hasDefault
+          ? field.defaultValue
+          : undefined
+        writeNode(field.node, fieldValue, writer)
+      }
+      return
+    }
+    case "union": {
+      const index = node.branches.findIndex((branch) => matchesNode(branch, value))
+      if (index === -1) {
+        throw expected(node, value)
+      }
+      writer.writeLong(index)
+      writeNode(node.branches[index], value, writer)
+      return
+    }
+    case "ref":
+      return writeNode(resolveNode(node), value, writer)
+  }
+}
+
+const matchesNode = (node: Node, value: unknown): boolean => {
+  node = resolveNode(node)
+  switch (node._tag) {
+    case "null":
+      return value === null
+    case "boolean":
+      return typeof value === "boolean"
+    case "int":
+      return Number.isInteger(value)
+    case "long":
+    case "float":
+    case "double":
+      return typeof value === "number" && Number.isFinite(value)
+    case "bytes":
+      return Buffer.isBuffer(value) || value instanceof Uint8Array
+    case "fixed":
+      return (Buffer.isBuffer(value) || value instanceof Uint8Array) && value.byteLength === node.size
+    case "string":
+      return typeof value === "string"
+    case "enum":
+      return typeof value === "string" && node.symbols.includes(value)
+    case "array":
+      return Array.isArray(value)
+    case "map":
+      return isRecordLike(value)
+    case "record":
+      return isRecordLike(value) &&
+        tagMatches(node, value) &&
+        node.fields.every((field) => Object.hasOwn(value, field.name) || field.hasDefault)
+    case "union":
+      return node.branches.some((branch) => matchesNode(branch, value))
+    case "ref":
+      return matchesNode(resolveNode(node), value)
+  }
+}
+
+const tagMatches = (node: Extract<Node, { readonly _tag: "record" }>, value: Record<string, unknown>) => {
+  const tag = node.schema["x-effect-tag"]
+  return typeof tag !== "string" || value._tag === tag
+}
+
+const readBlocks = (reader: BinaryReader, read: (count: number) => void) => {
+  while (true) {
+    const count = reader.readLong()
+    if (count === 0) {
+      return
+    }
+    if (count < 0) {
+      const actualCount = Math.abs(count)
+      reader.readLong() // block size in bytes; data is still consumed item-by-item
+      read(actualCount)
+    } else {
+      read(count)
+    }
+  }
+}
+
+class BinaryWriter {
+  private readonly chunks: Array<Buffer> = []
+
+  writeByte(byte: number) {
+    this.chunks.push(Buffer.from([byte]))
+  }
+
+  writeLong(value: number) {
+    if (!Number.isSafeInteger(value)) {
+      throw new AvroError(`Avro long value is outside the JavaScript safe integer range: ${value}`)
+    }
+    let encoded = (BigInt(value) << 1n) ^ (BigInt(value) >> 63n)
+    const bytes: Array<number> = []
+    while ((encoded & ~0x7fn) !== 0n) {
+      bytes.push(Number((encoded & 0x7fn) | 0x80n))
+      encoded >>= 7n
+    }
+    bytes.push(Number(encoded))
+    this.chunks.push(Buffer.from(bytes))
+  }
+
+  writeFloat(value: number) {
+    const buffer = Buffer.allocUnsafe(4)
+    buffer.writeFloatLE(value, 0)
+    this.chunks.push(buffer)
+  }
+
+  writeDouble(value: number) {
+    const buffer = Buffer.allocUnsafe(8)
+    buffer.writeDoubleLE(value, 0)
+    this.chunks.push(buffer)
+  }
+
+  writeBytes(value: Buffer) {
+    this.writeLong(value.length)
+    this.chunks.push(value)
+  }
+
+  writeFixed(value: Buffer, size: number) {
+    if (value.length !== size) {
+      throw new AvroError(`Expected fixed value of size ${size}, got ${value.length}`)
+    }
+    this.chunks.push(value)
+  }
+
+  writeString(value: string) {
+    this.writeBytes(Buffer.from(value, "utf8"))
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.concat(this.chunks)
+  }
+}
+
+class BinaryReader {
+  readonly buffer: Buffer
+  offset = 0
+
+  constructor(buffer: Buffer) {
+    this.buffer = buffer
+  }
+
+  get done(): boolean {
+    return this.offset === this.buffer.length
+  }
+
+  readByte(): number {
+    this.ensure(1)
+    return this.buffer[this.offset++]
+  }
+
+  readLong(): number {
+    let shift = 0n
+    let value = 0n
+    while (true) {
+      const byte = this.readByte()
+      value |= BigInt(byte & 0x7f) << shift
+      if ((byte & 0x80) === 0) {
+        break
+      }
+      shift += 7n
+      if (shift > 63n) {
+        throw new AvroError("Invalid Avro variable-length integer")
+      }
+    }
+    const decoded = (value >> 1n) ^ -(value & 1n)
+    const number = Number(decoded)
+    if (!Number.isSafeInteger(number)) {
+      throw new AvroError(`Decoded Avro long is outside the JavaScript safe integer range: ${decoded}`)
+    }
+    return number
+  }
+
+  readFloat(): number {
+    this.ensure(4)
+    const value = this.buffer.readFloatLE(this.offset)
+    this.offset += 4
+    return value
+  }
+
+  readDouble(): number {
+    this.ensure(8)
+    const value = this.buffer.readDoubleLE(this.offset)
+    this.offset += 8
+    return value
+  }
+
+  readBytes(): Buffer {
+    const length = this.readLong()
+    if (length < 0) {
+      throw new AvroError(`Invalid negative bytes length ${length}`)
+    }
+    return this.readFixed(length)
+  }
+
+  readFixed(size: number): Buffer {
+    this.ensure(size)
+    const value = this.buffer.subarray(this.offset, this.offset + size)
+    this.offset += size
+    return value
+  }
+
+  readString(): string {
+    return this.readBytes().toString("utf8")
+  }
+
+  private ensure(bytes: number) {
+    if (this.offset + bytes > this.buffer.length) {
+      throw new AvroError("Truncated Avro buffer")
+    }
+  }
+}
+
+const toBuffer = (value: unknown, label: string): Buffer => {
+  if (Buffer.isBuffer(value)) {
+    return value
+  }
+  if (value instanceof Uint8Array) {
+    return Buffer.from(value.buffer, value.byteOffset, value.byteLength)
+  }
+  throw new AvroError(`Expected ${label} to be Buffer or Uint8Array`)
+}
+
+const expected = (node: Node, value: unknown) =>
+  new AvroError(`Expected Avro ${node._tag}, got ${JSON.stringify(value)}`)
+
+const isRecordLike = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value)
+
+const message = (error: unknown): string => error instanceof Error ? error.message : String(error)
+
+const qualify = (name: string, namespace: string | undefined): string =>
+  name.includes(".") || namespace === undefined ? name : `${namespace}.${name}`
+
+const namedSchemaFullName = (name: string, namespace: string | undefined): string => {
+  if (name.includes(".")) {
+    return name
+  }
+  return namespace === undefined ? name : `${namespace}.${name}`
+}
+
+const unqualified = (name: string): string => {
+  const index = name.lastIndexOf(".")
+  return index === -1 ? name : name.slice(index + 1)
+}

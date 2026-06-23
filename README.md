@@ -1,10 +1,35 @@
-# avro-effect-schema
+# @avro-effect
 
-Effect v4 native Avro codec utilities.
+Effect v4 packages for working with Apache Avro schemas and binary data.
+
+This repository publishes two packages under the `@avro-effect` npm scope:
+
+| Package | Purpose |
+| --- | --- |
+| `@avro-effect/core` | Native Avro schema model plus binary encoder/decoder. |
+| `@avro-effect/schema` | Effect Schema v4 to Avro compiler, Avro to Effect Schema importer, and `Schema.Codec` integration. |
+
+The packages target the Effect v4 line from `effect-smol` and currently use `effect@4.0.0-beta.87`.
+
+## Install
+
+Use `@avro-effect/schema` when you want Effect Schema integration:
+
+```sh
+pnpm add @avro-effect/schema effect
+```
+
+Use `@avro-effect/core` directly when you only need Avro binary encoding and decoding:
+
+```sh
+pnpm add @avro-effect/core effect
+```
+
+## Effect Schema Codec
 
 ```ts
 import { Schema } from "effect"
-import { avro, Long } from "avro-effect-schema"
+import { avro, Long } from "@avro-effect/schema"
 
 class User extends Schema.Class<User>("User")({
   id: Long,
@@ -19,11 +44,49 @@ const buffer = encode(new User({ id: 1, name: "Ada" }))
 const user = decode(buffer)
 ```
 
-The package can:
+`@avro-effect/schema` can:
 
 - compile Effect Schema v4 schemas to Avro JSON schemas
-- build Effect schemas from Avro JSON schemas
-- encode and decode Avro binary buffers through `avro-js`
-- adapt `avro-js` wrapped unions to normal Effect values
-- omit and restore `_tag` literal fields for Avro records
+- import Avro JSON schemas as Effect schemas
+- encode and decode Avro binary buffers through the native `@avro-effect/core` runtime
+- handle records, enums, arrays, maps, unions, nullable fields, recursive named references, bytes, fixed values, and logical type annotations
+- omit `_tag` literal fields from Avro records and restore them after decoding tagged Effect unions
 
+## Native Avro Runtime
+
+```ts
+import { decode, encode } from "@avro-effect/core"
+
+const schema = {
+  type: "record",
+  name: "Event",
+  fields: [
+    { name: "id", type: "long" },
+    { name: "name", type: "string" }
+  ]
+} as const
+
+const bytes = encode(schema, { id: 1, name: "created" })
+const value = decode(schema, bytes)
+```
+
+`@avro-effect/core` is intentionally small and dependency-light. It replaces the previous `avro-js` runtime path for the schema package and exposes plain Avro union values rather than wrapper objects.
+
+## Development
+
+```sh
+pnpm install
+pnpm check
+pnpm test -- --run
+pnpm build
+```
+
+GitHub Actions mirrors the local flow:
+
+- `check.yml` runs build, typecheck, and tests
+- `release.yml` uses Changesets to open release PRs and publish to npm
+- `snapshot.yml` publishes PR snapshots through `pkg-pr-new` when enabled
+
+## Publishing
+
+The first release is version `0.0.1`. Publishing requires an npm automation token stored as the GitHub repository secret `NPM_TOKEN`. The optional repository variable `PKG_PR_NEW_ENABLED=true` enables snapshot publishing for pull requests after the `pkg-pr-new` GitHub App is installed.

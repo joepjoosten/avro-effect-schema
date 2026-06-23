@@ -1,0 +1,43 @@
+# @avro-effect/core
+
+Native Avro runtime primitives and codecs for Effect v4 projects.
+
+`@avro-effect/core` provides the lower-level runtime used by `@avro-effect/schema`. It handles Avro schema model types, named references, and binary encoding/decoding without depending on `avro-js`.
+
+## Install
+
+```sh
+pnpm add @avro-effect/core effect
+```
+
+## Usage
+
+```ts
+import { decode, encode, parse } from "@avro-effect/core"
+
+const schema = {
+  type: "record",
+  name: "Message",
+  fields: [
+    { name: "id", type: "long" },
+    { name: "body", type: "string" },
+    { name: "tags", type: { type: "array", items: "string" } }
+  ]
+} as const
+
+const type = parse(schema)
+const buffer = type.toBuffer({ id: 1, body: "hello", tags: ["avro"] })
+const message = type.fromBuffer(buffer)
+
+const bytes = encode(schema, message)
+const decoded = decode(schema, bytes)
+```
+
+## Features
+
+- Avro schema model types
+- Native Avro binary encoder and decoder
+- Primitive, record, enum, array, map, union, bytes, fixed, and logical type schema support
+- Named type, alias, namespace, and recursive reference handling
+- Plain union values rather than wrapper objects
+- `Effect.try` based `encodeEffect` and `decodeEffect` helpers

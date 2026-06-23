@@ -1,11 +1,6 @@
 import { Buffer } from "node:buffer"
-import { createRequire } from "node:module"
+import * as Avro from "@avro-effect/core"
 import { Effect, Option, Schema, SchemaAST, SchemaIssue, SchemaTransformation } from "effect"
-
-type AvroJs = typeof import("avro-js")
-
-const require = createRequire(import.meta.url)
-const avroJs = require("avro-js") as AvroJs
 
 export const AvroTypeAnnotationId = "@avro-effect-schema/type"
 export const AvroNameAnnotationId = "@avro-effect-schema/name"
@@ -113,14 +108,14 @@ export interface AvroCodecOptions extends ToAvroOptions {
 
 export interface CompiledAvroSchema {
   readonly schema: AvroSchema
-  readonly type: import("avro-js").Type
+  readonly type: Avro.Type
 }
 
 export interface AvroCodec<S extends Schema.Constraint>
   extends Schema.Codec<S["Type"], Buffer, S["DecodingServices"], S["EncodingServices"]>
 {
   readonly avro: AvroSchema
-  readonly avroType: import("avro-js").Type
+  readonly avroType: Avro.Type
   readonly schema: S
 }
 
@@ -201,7 +196,7 @@ export const compileAvro = <S extends Schema.Constraint>(
   const avroSchema = options.avroSchema ?? toAvroSchema(schema, options)
   return {
     schema: avroSchema,
-    type: avroJs.parse(avroSchema)
+    type: Avro.parse(avroSchema as Avro.AvroSchema)
   }
 }
 
@@ -696,15 +691,8 @@ const fromAvroRuntime = (value: unknown, schema: AvroSchema, registry: RuntimeRe
     if (value === null) {
       return null
     }
-    if (!isRecordLike(value)) {
-      return value
-    }
-    const keys = Object.keys(value)
-    if (keys.length !== 1) {
-      return value
-    }
-    const branch = resolveUnionBranch(keys[0], resolved, registry)
-    return branch === undefined ? value : fromAvroRuntime(value[keys[0]], branch, registry)
+    const branch = resolved.find((member) => branchName(member) !== "null" && matchesAvro(member, value, registry))
+    return branch === undefined ? value : fromAvroRuntime(value, branch, registry)
   }
   if (typeof resolved === "string") {
     return value
@@ -741,14 +729,7 @@ const fromAvroRuntime = (value: unknown, schema: AvroSchema, registry: RuntimeRe
 const toAvroRuntime = (value: unknown, schema: AvroSchema, registry: RuntimeRegistry): unknown => {
   const resolved = resolveRuntimeSchema(schema, registry)
   if (Array.isArray(resolved)) {
-    if (value === null && resolved.some((member) => branchName(member) === "null")) {
-      return null
-    }
-    const branch = resolved.find((member) => branchName(member) !== "null" && matchesAvro(member, value, registry))
-    if (branch === undefined) {
-      throw new AvroSchemaError(`Unable to select Avro union branch for ${JSON.stringify(value)}`)
-    }
-    return { [branchName(branch)]: toAvroRuntime(value, branch, registry) }
+    return value
   }
   if (typeof resolved === "string") {
     return primitiveToAvroRuntime(value, resolved)
@@ -825,7 +806,11 @@ const matchesAvro = (schema: AvroSchema, value: unknown, registry: RuntimeRegist
     case "record":
     case "error":
       return isRecordLike(value) &&
-        (concrete[EffectTagMetadataKey] === undefined || value._tag === concrete[EffectTagMetadataKey]) &&
+        (
+          concrete[EffectTagMetadataKey] === undefined ||
+          value._tag === concrete[EffectTagMetadataKey] ||
+          !Object.hasOwn(value, "_tag")
+        ) &&
         concrete.fields.every((field: AvroRecordField) => field.default !== undefined || Object.hasOwn(value, field.name))
     case "enum":
       return typeof value === "string" && concrete.symbols.includes(value)
@@ -839,16 +824,6 @@ const matchesAvro = (schema: AvroSchema, value: unknown, registry: RuntimeRegist
       return typeof concrete.type === "string" ? matchesAvro(concrete.type, value, registry) : false
   }
 }
-
-const resolveUnionBranch = (
-  key: string,
-  union: ReadonlyArray<AvroSchema>,
-  registry: RuntimeRegistry
-): AvroSchema | undefined =>
-  union.find((member) => {
-    const name = branchName(member)
-    return key === name || key === unqualified(name)
-  })
 
 const resolveRuntimeSchema = (schema: AvroSchema, registry: RuntimeRegistry): AvroSchema => {
   if (typeof schema === "string" && !primitiveNames.has(schema as AvroPrimitive)) {
